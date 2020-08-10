@@ -577,23 +577,36 @@
 ;;Converting ENSEMBL curies to UniProtKB curies using synonymization in order to pass into count-downstream
 (define uniprots (remove-duplicates (filter uniprot-curie? (map car (unwrap (set-map gene-list curie-synonyms/names))))))
 
+(make-hash 'ARDS-Genelist
+           (make-hash 'Gene1-ARDS
+                      (make-hash 'pos-reg-GO1
+                                 (make0hash 'GO1
+                                            (make-hash 'GO!-members
+                                                       (make-hash 'GO1-ARDS-members))))))
+(define go-processes (make-hash))
+(define go-process-members (make-hash))
+(define counter (make-hash))
 #|
 takes: list of UniProt curies (prot-list), list of GO predicates** (preds)
 ** note: preds should only contain "positively_regulates", "negatively_regulates", "subclass_of", or any combination
 **       of those three predicates depending on what type of relationshion you want to count
 returns: sorted (high->low) assoc list of a count of the number of other proteins in prot-list that each prot in prot-list regulates
 |#
+;;TODO: what if people's names for rtx2 is different?
+;;report the actual uniprots rather than just the count
+;;report as nested hash
+;;add cellular context
 (define (count-downstream prot-list preds)
   ;;hash that maps each Uniprot curie (key) in prot-list -> set of all GO pathways (value) that the UniProt (key) regulates
-  (define go-processes (make-hash))
+  (hash-clear! go-processes)
   ;;hash that maps GO pathway curie (key) -> set of all UniProts (value) that are members of the GO pathway (key) AND in the prot-list
-  (define go-process-members (make-hash))
-  (define counter (make-hash))
-  (define involved_in (keep 1 (filter (lambda (x) (eq? (car x) 'rtx2)) (find-predicates '("involved_in")))))
-  (define regulators (filter (lambda (x) (eq? (car x) 'rtx2)) (find-predicates preds)))
+  (hash-clear! go-process-members)
+  (hash-clear! counter)
+  (define involved_in (keep 1 (filter (lambda (x) (equal? (car x) 'rtx2)) (find-exact-predicates '("involved_in")))))
+  (define regulators (filter (lambda (x) (equal? (car x) 'rtx2)) (find-exact-predicates preds)))
   (for-each
    (lambda (u)
-     (define S (filter (lambda (x) (eq? (car x) 'rtx2)) (find-concepts #t (list u))))
+     (define S (filter (lambda (x) (equal? (car x) 'rtx2)) (find-concepts #t (list u))))
      ;;this run/graph contains 2-hop query (G->M->X) and 1-hop query (P->X)
      ;;2-hop (G->M->X): Finds the GO pathways (X) that UniProt (G) regulates
      ;;1-hop (P->X): Finds the UniProts (P) that are members of the GO pathway (X)
@@ -636,6 +649,19 @@ returns: sorted (high->low) assoc list of a count of the number of other protein
   (sort-count counter)
   )
 
+  (hash-for-each go-processes
+                 (lambda (k v)
+                   (define members (mutable-set))
+                   (set-for-each v
+                                 (lambda (g)
+                                   (set-union! members (set-intersect (list->set prot-list) (hash-ref go-process-members g (set))))
+                                   ))
+                   (hash-set! counter k (set-count members))
+                   )
+                 )
+  (count-downstream uniprots '("positievly_regulates"))
+  (count-downstream uniprots '("negatively_regulates"))
+  
 #|2-hop query using query/graph
 (for-each
  (lambda (x) (time
@@ -653,7 +679,7 @@ returns: sorted (high->low) assoc list of a count of the number of other protein
  )
 |#
 
-#|
+
 (define (uniprot->ensembl uni)
   (set-intersect (set->list gene-list) (map car (curie-synonyms/names uni)))
   )
@@ -683,7 +709,7 @@ returns: sorted (high->low) assoc list of a count of the number of other protein
                  )
                )
 (sort-by-length regulates-go)
-|#
+
 
 (define preds-of-interest '("negatively_regulates"
                             "physically_interacts_with"
@@ -721,15 +747,17 @@ returns: sorted (high->low) assoc list of a count of the number of other protein
       (backtrace all-upstreams g-list))
   )
   
-(backtrace g-of-interest gene-list)
+;;(backtrace g-of-interest gene-list)
 
-#|
+
 (define endpoints (mutable-set))
+(define seen-count (make-hash))
 (define prots-seen (mutable-set))
 
 (define (backtrace-by-go cur-prot)
-  (set-add! prots-seen cur-prot)
+  (hash-update! seen-count cur-prot (lambda (x) (+ x 1)) 0)
   (define all-gos (hash-ref member-of cur-prot '()))
+  ;;all uniprots that regulate the go processes that cur-prot is a member of
   (define all-upstreams (mutable-set))
   (for-each
    (lambda (gp)
@@ -737,20 +765,30 @@ returns: sorted (high->low) assoc list of a count of the number of other protein
      )
    all-gos
    )
+  ;;check each uniprot in all-upstreams to see of the count exceeds the number of other uniprots they regulate
+  ;;if it does exceed, add the uniprot to the seen list
+  (set-for-each all-upstreams
+                (lambda (u)
+                  (unless (< (hash-ref seen-count u 0) (hash-ref counter u))
+                    (set-add! prots-seen u)
+                    )
+                  )
+                )
+  ;;subtract all uniprots in the seen list from all-upstreams
+  (set-subtract! all-upstreams prots-seen)             
+  (printf "~v : ~v\n" cur-prot (set-count all-upstreams))
   (if (set-empty? all-upstreams) (set-add! endpoints cur-prot)
-      ((printf "~v : ~v\n" cur-prot (set-count all-upstreams))
-       (set-subtract! all-upstreams prots-seen)
-       (set-for-each all-upstreams
-                     (lambda (u)
-                       (backtrace-by-go u)
-                       )
-                     )    )    
+      (set-for-each all-upstreams
+                    (lambda (u)
+                      (backtrace-by-go u)
+                      )
+                    )
       )
   )
 
 (set-clear! endpoints)
 (backtrace-by-go "UniProtKB:P01137")
-|#
+
 #|
 Top10 from count-downstream of ARDS gene-list
 
